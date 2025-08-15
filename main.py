@@ -1,100 +1,30 @@
 import os
-from murf import Murf
+import logging
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-import assemblyai as aai
-from google import genai
-from typing import Dict,List
-from google.genai import types
+from schemas import AgentChatResponse, LLMRequest, STTRequest, TTSRequest
+from services.stt_service import STTService
+from services.tts_service import TTSService
+from services.llm_service import LLMService
+from utils.helpers import FALLBACK_TEXT, DEFAULT_VOICE_ID, update_chat_history
 
 # Configuration & Constants
 load_dotenv()
 
-# Constants
-FALLBACK_TEXT = "I'm having trouble connecting right now."
-FALLBACK_AUDIO_URLS = []
-DEFAULT_VOICE_ID = "en-US-terrell"
-CHUNK_SIZE = 3000
-MODEL_NAME = "gemini-2.5-flash"
+# Initialize services
+stt_service = STTService(api_key=os.getenv("ASSEMBLY_API_KEY"))
+tts_service = TTSService(api_key=os.getenv("MURF_API_KEY"))
+llm_service = LLMService(api_key=os.getenv("GEMINI_API_KEY"))
 
-# Initialize Services
-murf_client = Murf(api_key=os.getenv("MURF_API_KEY"))
-aai.settings.api_key = os.getenv("ASSEMBLY_API_KEY")
-gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-
-# Assembly AI COnfiguration
-transcriber = aai.Transcriber(
-    config = aai.TranscriptionConfig(
-        speech_model=aai.SpeechModel.best,
-        punctuate=True,
-        format_text=True,
-        language_code="en"
-    )
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-
-# Chat History Store {session_id: [{"role": "user" | "model", "context": "text"}]}
-chat_history_store : Dict[str, List[Dict[str, str]]] = {}
-
-# Helper Functions
-def transcribe_audio(audio_bytes: bytes) -> str:
-    """Transcribe audio using AssemblyAI"""
-    transcript = transcriber.transcribe(audio_bytes)
-    return transcript.text.strip()
-
-def build_gemini_input(history: List[Dict[str, str]]) -> List[types.Content]:
-    """Format Chat History For Gemini API"""
-    return [
-        types.Content(
-            role=msg["role"],
-            parts=[
-                types.Part(
-                    text=msg["content"]
-                )
-            ]
-        )
-
-        for msg in history
-    ]
-
-def generate_gemini_response(history: List[Dict[str, str]]) -> str:
-    """Generate Response using Gemini API"""
-    response = gemini_client.models.generate_content(
-        model=MODEL_NAME,
-        contents=build_gemini_input(history)
-    )
-
-    return response.text.strip()
-
-def generate_tts_audio(text: str) -> List[str]:
-    """Convert text to speech using MURF AI"""
-    chunks = [text[i : i + CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)]
-    audio_urls = []
-
-    for chunk in chunks:
-        result = murf_client.text_to_speech.generate(
-            text=chunk,
-            voice_id=DEFAULT_VOICE_ID
-        )
-
-        audio_urls.append(result.audio_file)
-
-    return audio_urls
-
-def handle_tts_fallback() -> List[str]:
-    """Handle TTS Fallback Scenerio"""
-    try:
-        result = murf_client.text_to_speech.generate(
-            text=FALLBACK_TEXT,
-            voice_id=DEFAULT_VOICE_ID
-        )
-
-        return [result.audio_file]
-
-    except Exception:
-        return []
+logger = logging.getLogger(__name__)
     
 # Fast API Setup
 app = FastAPI()
@@ -111,65 +41,55 @@ async def get_index(request: Request):
 @app.post("/agent/chat/{session_id}")
 async def agent_chat(session_id: str, audio: UploadFile = File(...)):
     try:
-        # Process Audio Input
         audio_bytes = await audio.read()
-
-        try:
-            user_text = transcribe_audio(audio_bytes)
         
+        # STT processing
+        try:
+            user_text = stt_service.transcribe(STTRequest(audio_bytes=audio_bytes))
         except Exception as stt_error:
-            print(f"[Error] STT failed: {stt_error}")
-            return {
-                "audio_urls": FALLBACK_AUDIO_URLS,
-                "transcription": None,
-                "gemini_response": FALLBACK_TEXT,
-                "chat_history": [],
-                "error": "Speech To Text Failed"
-            }
+            logger.error(f"STT failed: {stt_error}")
+            return AgentChatResponse(
+                audio_urls=[],
+                gemini_response=FALLBACK_TEXT,
+                chat_history=[],
+                error="Speech to Text failed"
+            )
         
-        # Manage Chat History
-        history = chat_history_store.get(session_id, [])
-        history.append({
-            "role": "user",
-            "content": user_text
-        })
-
-        # Generate AI Response
+        # Update chat history
+        history = update_chat_history(session_id, "user", user_text)
+        
+        # LLM processing
         try:
-            full_text = generate_gemini_response(history)
-
+            ai_response = llm_service.generate_response(
+                LLMRequest(history=history)
+            )
         except Exception as llm_error:
-            print(f"[Error] LLM failed: {llm_error}")
-            full_text = FALLBACK_TEXT
-
-        history.append({
-            "role" : "model",
-            "content": full_text
-        })
-
-        chat_history_store[session_id] = history
-
-        # Convert Response to Speech
-        try:
-            audio_urls = generate_tts_audio(full_text)
+            logger.error(f"LLM failed: {llm_error}")
+            ai_response = FALLBACK_TEXT
         
+        update_chat_history(session_id, "model", ai_response)
+        
+        # TTS processing
+        try:
+            audio_urls = tts_service.generate_audio(
+                TTSRequest(text=ai_response)
+            )
         except Exception as tts_error:
-            print(f"[Error] TTS failed: {tts_error}")
-            audio_urls = handle_tts_fallback()
-
-        return {
-            "audio_urls": audio_urls,
-            "transcription": user_text,
-            "gemini_response": full_text,
-            "chat_history": history
-        }
-
+            logger.error(f"TTS failed: {tts_error}")
+            audio_urls = tts_service.fallback_audio(FALLBACK_TEXT, DEFAULT_VOICE_ID)
+        
+        return AgentChatResponse(
+            audio_urls=audio_urls,
+            transcription=user_text,
+            gemini_response=ai_response,
+            chat_history=history
+        )
+            
     except Exception as e:
-        print(f"[Fatal Error] {e}")
-        return {
-            "audio_urls": FALLBACK_AUDIO_URLS,
-            "transcription": None,
-            "gemini_response": FALLBACK_TEXT,
-            "chat_history": [],
-            "error": "Unexpected Server Error"
-        }
+        logger.exception(f"Unexpected error: {e}")
+        return AgentChatResponse(
+            audio_urls=[],
+            gemini_response=FALLBACK_TEXT,
+            chat_history=[],
+            error="Unexpected server error"
+        )

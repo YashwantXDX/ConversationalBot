@@ -60,7 +60,14 @@ The bot maintains a chat history for each `session_id` to provide contextual con
 
 ```
 conversation-bot/
-│
+├── main.py             # FastAPI backend application
+├── schemas.py          (Pydantic models)
+├── services/           (service implementations)
+│   ├── stt_service.py
+│   ├── tts_service.py
+│   └── llm_service.py
+├── utils/              (helper functions)
+│   └── helpers.py
 ├── static/                   # Frontend static assets
 │   ├── script.js
 │   ├── session_management.js
@@ -68,10 +75,6 @@ conversation-bot/
 │
 ├── templates/                # HTML templates
 │   └── index.html
-│
-├── main.py                    # FastAPI backend application
-├── README.md                  # Project documentation
-└── .env                       # Environment variables (not committed to Git)
 ```
 ---
 
@@ -85,7 +88,7 @@ cd ConversationalBot
 
 ### 2. Install Dependencies
 ```bash
-pip install fastapi uvicorn python-dotenv murf assemblyai google-genai
+pip install fastapi uvicorn python-dotenv murf assemblyai google-genai pydantic
 ```
 
 ### 3. Create a `.env` File
