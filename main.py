@@ -1,7 +1,7 @@
 import os
 import logging
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, UploadFile, File
+from fastapi import FastAPI, Request, UploadFile, File, WebSocket
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -93,3 +93,16 @@ async def agent_chat(session_id: str, audio: UploadFile = File(...)):
             chat_history=[],
             error="Unexpected server error"
         )
+    
+# Web Socket Connection
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    while True:
+        try:
+            data = await websocket.receive_text()
+            await websocket.send_text(f"Echo Text : {data}")
+
+        except Exception as e:
+            logger.error(f"WebSocket connection closed: {e}")
+            break
