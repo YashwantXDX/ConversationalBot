@@ -2,6 +2,7 @@
 let mediaRecorder;
 let audioChunks = [];
 let autoConversation = true;
+let ws;
 
 const recordBtn = document.getElementById('record-btn');
 const echoAudioPlayer = document.getElementById('audio-playback');
@@ -18,7 +19,7 @@ let isRecording = false;
 stopConversation.addEventListener('click', () => {
     autoConversation = false;
     isRecording = false;
-    recordBtn.textContent = "🎙️ Start Recording";
+    recordBtn.textContent = "🎙️ Start Streaming";
     recordBtn.classList.remove('recording');
     statusText.textContent = "Conversation Stopped"
 })
@@ -28,24 +29,29 @@ recordBtn.addEventListener('click', async () => {
     if (!isRecording) {
         // Start Recording
         try {
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            mediaRecorder = new MediaRecorder(stream);
-            audioChunks = [];
+            
+            // Connect to websocket
+            ws = new WebSocket("ws://localhost:8000/ws/audio");
 
-            mediaRecorder.ondataavailable = e => {
-                if (e.data.size > 0) audioChunks.push(e.data);
-            };
+            ws.onopen = async () => {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream);
 
-            mediaRecorder.onstop = () => {
-                const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
-                sendToGemini(audioBlob);
-            };
+                mediaRecorder.ondataavailable = e => {
+                    if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+                        e.data.arrayBuffer().then(buffer => {
+                            ws.send(buffer);
+                        });
+                    }
+                };
 
-            mediaRecorder.start();
+            mediaRecorder.start(500);
             isRecording = true;
-            recordBtn.textContent = "⏹️ Stop Recording";
+            recordBtn.textContent = "⏹️ Stop Streaming";
             recordBtn.classList.add('recording');
             recordBtn.disabled = false;
+            statusText.textContent = "Streaming audio...";
+        }
 
         } catch (error) {
             alert("Microphone access denied or not available");
@@ -56,104 +62,109 @@ recordBtn.addEventListener('click', async () => {
         if (mediaRecorder && mediaRecorder.state !== 'inactive') {
             mediaRecorder.stop();
         }
+
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.close();
+        }
+
         isRecording = false;
-        recordBtn.textContent = "⏳ Wait for Response";
+        recordBtn.textContent = "🎙️ Start Streaming";
         recordBtn.disabled = true;
         recordBtn.classList.remove('recording');
     }
 });
 
 // Transcribe Audio and Send it to Gemini Functionality
-function sendToGemini(audioBlob){
+// function sendToGemini(audioBlob){
 
-    const formData = new FormData();
-    const filename = `recording_${Date.now()}.webm`;
-    const file = new File([audioBlob], filename, {type: 'audio/webm'});
-    formData.append('audio', file);
+//     const formData = new FormData();
+//     const filename = `recording_${Date.now()}.webm`;
+//     const file = new File([audioBlob], filename, {type: 'audio/webm'});
+//     formData.append('audio', file);
 
-    statusText.textContent = 'Processing...';
+//     statusText.textContent = 'Processing...';
 
-    fetch(`http://localhost:8000/agent/chat/${sessionId}`, {
-        method: 'POST',
-        body: formData
-    })
-    .then(response => response.json())
-    .then(data => {
+//     fetch(`http://localhost:8000/agent/chat/${sessionId}`, {
+//         method: 'POST',
+//         body: formData
+//     })
+//     .then(response => response.json())
+//     .then(data => {
 
-        // Handle API Level Errors
-        if(data.error){
-            console.error("Server Error: ", data.error);
-            statusText.textContent = "Error: " + data.error;
-            recordBtn.disabled = false;
-            recordBtn.textContent = "🎙️ Start Recording";
-            return;
-        }
+//         // Handle API Level Errors
+//         if(data.error){
+//             console.error("Server Error: ", data.error);
+//             statusText.textContent = "Error: " + data.error;
+//             recordBtn.disabled = false;
+//             recordBtn.textContent = "🎙️ Start Recording";
+//             return;
+//         }
         
-        // If Audio Urls Exists
-        if(data.audio_urls && data.audio_urls.length > 0){
+//         // If Audio Urls Exists
+//         if(data.audio_urls && data.audio_urls.length > 0){
             
-            statusText.textContent = "Playing Response";
+//             statusText.textContent = "Playing Response";
 
-            playSequentialAudio(data.audio_urls, () => {
+//             playSequentialAudio(data.audio_urls, () => {
 
-                // Re-Enable button and show Stop Recording again
-                recordBtn.disabled = false;
-                recordBtn.textContent = "⏹️ Stop Recording";
+//                 // Re-Enable button and show Stop Recording again
+//                 recordBtn.disabled = false;
+//                 recordBtn.textContent = "⏹️ Stop Recording";
 
-                // Auto Start Recording again after bot finishes
-                if(autoConversation)
-                    recordBtn.click();
+//                 // Auto Start Recording again after bot finishes
+//                 if(autoConversation)
+//                     recordBtn.click();
 
-            });
+//             });
 
-        }
+//         }
         
-        else{
-            statusText.textContent =  data.gemini_response || "No Response from Server";
-            console.warn("No Audio Urls returned, showing text only.");
-            autoConversation = false;
-            recordBtn.disabled = false;
-            recordBtn.textContent = "🎙️ Start Recording";
-            console.error(data);
-        }
-    })
-    .catch(err => {
-        statusText.textContent = "Error Sending to Gemini";
-        autoConversation = false;
-        recordBtn.disabled = false;
-        recordBtn.textContent = "🎙️ Start Recording";
-        console.error(err);
-    })
+//         else{
+//             statusText.textContent =  data.gemini_response || "No Response from Server";
+//             console.warn("No Audio Urls returned, showing text only.");
+//             autoConversation = false;
+//             recordBtn.disabled = false;
+//             recordBtn.textContent = "🎙️ Start Recording";
+//             console.error(data);
+//         }
+//     })
+//     .catch(err => {
+//         statusText.textContent = "Error Sending to Gemini";
+//         autoConversation = false;
+//         recordBtn.disabled = false;
+//         recordBtn.textContent = "🎙️ Start Recording";
+//         console.error(err);
+//     })
 
-}
+// }
 
-// Play All the Audio Urls Sequentially
-function playSequentialAudio(audio_urls, onComplete){
+// // Play All the Audio Urls Sequentially
+// function playSequentialAudio(audio_urls, onComplete){
 
-    let index = 0;
-    const audio = echoAudioPlayer;
+//     let index = 0;
+//     const audio = echoAudioPlayer;
 
-    // Internal Function to play next audio url
-    function playNext(){
+//     // Internal Function to play next audio url
+//     function playNext(){
 
-        if(index < audio_urls.length){
+//         if(index < audio_urls.length){
 
-            audio.src = audio_urls[index];
-            audio.play();
-            index++;
+//             audio.src = audio_urls[index];
+//             audio.play();
+//             index++;
 
-        }
-        else{
+//         }
+//         else{
 
-            statusText.textContent = "Response Complete"
-            if(onComplete && autoConversation) onComplete();
+//             statusText.textContent = "Response Complete"
+//             if(onComplete && autoConversation) onComplete();
 
-        }
+//         }
 
-    }
+//     }
 
-    // When the audio is finished, it will play the next audio
-    audio.onended = playNext;
-    playNext();
+//     // When the audio is finished, it will play the next audio
+//     audio.onended = playNext;
+//     playNext();
 
-}
+// }

@@ -1,3 +1,4 @@
+from datetime import datetime
 import os
 import logging
 from dotenv import load_dotenv
@@ -94,15 +95,18 @@ async def agent_chat(session_id: str, audio: UploadFile = File(...)):
             error="Unexpected server error"
         )
     
-# Web Socket Connection
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+# Web Socket Connection for Audio Streaming
+@app.websocket("/ws/audio")
+async def audio_websocket(websocket: WebSocket):
     await websocket.accept()
-    while True:
-        try:
-            data = await websocket.receive_text()
-            await websocket.send_text(f"Echo Text : {data}")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = f"recording_{timestamp}.webm"
 
+    # open file in binary append mode
+    with open(output_file, "ab") as f:
+        try:
+            while True:
+                data = await websocket.receive_bytes()
+                f.write(data)
         except Exception as e:
-            logger.error(f"WebSocket connection closed: {e}")
-            break
+            logger.error(f"Audio WebSocket closed: {e}")
