@@ -1,170 +1,132 @@
-// Conversational Bot using MediaRecorder API
-let mediaRecorder;
-let audioChunks = [];
-let autoConversation = true;
+// Robust Streaming PCM16 @ 16kHz over WebSocket to FastAPI
 let ws;
+let isRecording = false;
+let autoConversation = true;
+let audioContext, sourceNode, processorNode;
 
 const recordBtn = document.getElementById('record-btn');
-const echoAudioPlayer = document.getElementById('audio-playback');
 const stopConversation = document.getElementById('stop-conversation');
 const statusText = document.getElementById('transcript-status');
 
-// Get session_id from URL
-const urlParamaters = new URLSearchParams(window.location.search);
-const sessionId = urlParamaters.get("session_id");
+// --- UI helper ---
+function setStatus(msg) {
+  if (statusText) statusText.textContent = msg;
+  console.log(msg);
+}
 
-let isRecording = false;
-
-// Function to Stop the Conversation
-stopConversation.addEventListener('click', () => {
-    autoConversation = false;
-    isRecording = false;
-    recordBtn.textContent = "🎙️ Start Streaming";
-    recordBtn.classList.remove('recording');
-    statusText.textContent = "Conversation Stopped"
-})
-
-// Toggle Recording
-recordBtn.addEventListener('click', async () => {
-    if (!isRecording) {
-        // Start Recording
-        try {
-            
-            // Connect to websocket
-            ws = new WebSocket("ws://localhost:8000/ws/audio");
-
-            ws.onopen = async () => {
-                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                mediaRecorder = new MediaRecorder(stream);
-
-                mediaRecorder.ondataavailable = e => {
-                    if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
-                        e.data.arrayBuffer().then(buffer => {
-                            ws.send(buffer);
-                        });
-                    }
-                };
-
-            mediaRecorder.start(500);
-            isRecording = true;
-            recordBtn.textContent = "⏹️ Stop Streaming";
-            recordBtn.classList.add('recording');
-            recordBtn.disabled = false;
-            statusText.textContent = "Streaming audio...";
-        }
-
-        } catch (error) {
-            alert("Microphone access denied or not available");
-            console.error(error);
-        }
-    } else {
-        // Stop Recording
-        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-            mediaRecorder.stop();
-        }
-
-        if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.close();
-        }
-
-        isRecording = false;
-        recordBtn.textContent = "🎙️ Start Streaming";
-        recordBtn.disabled = true;
-        recordBtn.classList.remove('recording');
-    }
+// Stop conversation button
+stopConversation?.addEventListener('click', () => {
+  autoConversation = false;
+  stopStreaming();
+  setStatus("Conversation Stopped");
 });
 
-// Transcribe Audio and Send it to Gemini Functionality
-// function sendToGemini(audioBlob){
+// --- PCM utilities ---
+function downsampleBuffer(buffer, inputSampleRate, outSampleRate = 16000) {
+  if (outSampleRate === inputSampleRate) return buffer;
+  const sampleRateRatio = inputSampleRate / outSampleRate;
+  const newLength = Math.round(buffer.length / sampleRateRatio);
+  const result = new Float32Array(newLength);
+  let offsetResult = 0, offsetBuffer = 0;
+  while (offsetResult < result.length) {
+    const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+    let accum = 0, count = 0;
+    for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+      accum += buffer[i];
+      count++;
+    }
+    result[offsetResult] = accum / count || 0;
+    offsetResult++;
+    offsetBuffer = nextOffsetBuffer;
+  }
+  return result;
+}
 
-//     const formData = new FormData();
-//     const filename = `recording_${Date.now()}.webm`;
-//     const file = new File([audioBlob], filename, {type: 'audio/webm'});
-//     formData.append('audio', file);
+function floatTo16BitPCM(float32Array) {
+  const buffer = new ArrayBuffer(float32Array.length * 2);
+  const view = new DataView(buffer);
+  let offset = 0;
+  for (let i = 0; i < float32Array.length; i++, offset += 2) {
+    let s = Math.max(-1, Math.min(1, float32Array[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+  return buffer;
+}
 
-//     statusText.textContent = 'Processing...';
+// --- Start streaming ---
+async function startStreaming() {
+  if (isRecording) return;
 
-//     fetch(`http://localhost:8000/agent/chat/${sessionId}`, {
-//         method: 'POST',
-//         body: formData
-//     })
-//     .then(response => response.json())
-//     .then(data => {
+  const protocol = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${protocol}://${location.host}/ws/audio`);
 
-//         // Handle API Level Errors
-//         if(data.error){
-//             console.error("Server Error: ", data.error);
-//             statusText.textContent = "Error: " + data.error;
-//             recordBtn.disabled = false;
-//             recordBtn.textContent = "🎙️ Start Recording";
-//             return;
-//         }
-        
-//         // If Audio Urls Exists
-//         if(data.audio_urls && data.audio_urls.length > 0){
-            
-//             statusText.textContent = "Playing Response";
+  ws.onopen = async () => {
+    setStatus("WebSocket connected. Requesting microphone...");
 
-//             playSequentialAudio(data.audio_urls, () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      sourceNode = audioContext.createMediaStreamSource(stream);
+      processorNode = audioContext.createScriptProcessor(4096, 1, 1);
 
-//                 // Re-Enable button and show Stop Recording again
-//                 recordBtn.disabled = false;
-//                 recordBtn.textContent = "⏹️ Stop Recording";
+      processorNode.onaudioprocess = (event) => {
+        if (!isRecording || ws.readyState !== WebSocket.OPEN) return;
+        const input = event.inputBuffer.getChannelData(0);
+        const downsampled = downsampleBuffer(input, audioContext.sampleRate, 16000);
+        const pcm16 = floatTo16BitPCM(downsampled);
+        ws.send(new Uint8Array(pcm16));
+      };
 
-//                 // Auto Start Recording again after bot finishes
-//                 if(autoConversation)
-//                     recordBtn.click();
+      sourceNode.connect(processorNode);
+      processorNode.connect(audioContext.destination); // optional: remove to avoid echo
 
-//             });
+      ws.onmessage = (evt) => setStatus(evt.data);
+      ws.onclose = () => setStatus("WebSocket closed.");
+      ws.onerror = (e) => console.error("WebSocket error", e);
 
-//         }
-        
-//         else{
-//             statusText.textContent =  data.gemini_response || "No Response from Server";
-//             console.warn("No Audio Urls returned, showing text only.");
-//             autoConversation = false;
-//             recordBtn.disabled = false;
-//             recordBtn.textContent = "🎙️ Start Recording";
-//             console.error(data);
-//         }
-//     })
-//     .catch(err => {
-//         statusText.textContent = "Error Sending to Gemini";
-//         autoConversation = false;
-//         recordBtn.disabled = false;
-//         recordBtn.textContent = "🎙️ Start Recording";
-//         console.error(err);
-//     })
+      isRecording = true;
+      recordBtn.textContent = "⏹️ Stop Streaming";
+      recordBtn.classList.add('recording');
+      setStatus("Streaming audio...");
+    } catch (err) {
+      console.error(err);
+      alert("Microphone access denied or unavailable");
+    }
+  };
+}
 
-// }
+// --- Stop streaming ---
+function stopStreaming() {
+  if (!isRecording) return;
 
-// // Play All the Audio Urls Sequentially
-// function playSequentialAudio(audio_urls, onComplete){
+  if (ws && ws.readyState === WebSocket.OPEN) ws.close();
 
-//     let index = 0;
-//     const audio = echoAudioPlayer;
+  // Cleanup audio nodes
+  if (processorNode) {
+    processorNode.disconnect();
+    processorNode.onaudioprocess = null;
+    processorNode = null;
+  }
+  if (sourceNode) {
+    sourceNode.disconnect();
+    sourceNode = null;
+  }
+  if (audioContext) {
+    audioContext.close();
+    audioContext = null;
+  }
 
-//     // Internal Function to play next audio url
-//     function playNext(){
+  isRecording = false;
+  recordBtn.textContent = "🎙️ Start Streaming";
+  recordBtn.classList.remove('recording');
+  setStatus("Streaming stopped");
+}
 
-//         if(index < audio_urls.length){
-
-//             audio.src = audio_urls[index];
-//             audio.play();
-//             index++;
-
-//         }
-//         else{
-
-//             statusText.textContent = "Response Complete"
-//             if(onComplete && autoConversation) onComplete();
-
-//         }
-
-//     }
-
-//     // When the audio is finished, it will play the next audio
-//     audio.onended = playNext;
-//     playNext();
-
-// }
+// --- Toggle button ---
+recordBtn.addEventListener('click', async () => {
+  if (!isRecording) {
+    await startStreaming();
+  } else {
+    stopStreaming();
+  }
+});
