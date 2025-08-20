@@ -1,27 +1,22 @@
-// Robust Streaming PCM16 @ 16kHz over WebSocket to FastAPI
 let ws;
 let isRecording = false;
-let autoConversation = true;
 let audioContext, sourceNode, processorNode;
 
 const recordBtn = document.getElementById('record-btn');
 const stopConversation = document.getElementById('stop-conversation');
 const statusText = document.getElementById('transcript-status');
 
-// --- UI helper ---
 function setStatus(msg) {
   if (statusText) statusText.textContent = msg;
   console.log(msg);
 }
 
-// Stop conversation button
 stopConversation?.addEventListener('click', () => {
-  autoConversation = false;
   stopStreaming();
   setStatus("Conversation Stopped");
 });
 
-// --- PCM utilities ---
+// --- PCM helpers ---
 function downsampleBuffer(buffer, inputSampleRate, outSampleRate = 16000) {
   if (outSampleRate === inputSampleRate) return buffer;
   const sampleRateRatio = inputSampleRate / outSampleRate;
@@ -55,13 +50,13 @@ function floatTo16BitPCM(float32Array) {
 
 // --- Start streaming ---
 async function startStreaming() {
-  if (isRecording) return;
+  if (isRecording || ws) return;
 
   const protocol = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${protocol}://${location.host}/ws/audio`);
 
   ws.onopen = async () => {
-    setStatus("WebSocket connected. Requesting microphone...");
+    setStatus("Connected. Requesting microphone...");
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -78,15 +73,23 @@ async function startStreaming() {
       };
 
       sourceNode.connect(processorNode);
-      processorNode.connect(audioContext.destination); // optional: remove to avoid echo
+      processorNode.connect(audioContext.destination); // optional for monitoring
 
       ws.onmessage = (evt) => setStatus(evt.data);
-      ws.onclose = () => setStatus("WebSocket closed.");
+
+      ws.onclose = () => {
+        setStatus("WebSocket closed");
+        ws = null;
+        isRecording = false;
+        recordBtn.textContent = "🎙️ Start Streaming";
+        recordBtn.classList.remove("recording");
+      };
+
       ws.onerror = (e) => console.error("WebSocket error", e);
 
       isRecording = true;
       recordBtn.textContent = "⏹️ Stop Streaming";
-      recordBtn.classList.add('recording');
+      recordBtn.classList.add("recording");
       setStatus("Streaming audio...");
     } catch (err) {
       console.error(err);
@@ -99,9 +102,7 @@ async function startStreaming() {
 function stopStreaming() {
   if (!isRecording) return;
 
-  if (ws && ws.readyState === WebSocket.OPEN) ws.close();
-
-  // Cleanup audio nodes
+  // stop sending audio
   if (processorNode) {
     processorNode.disconnect();
     processorNode.onaudioprocess = null;
@@ -111,19 +112,24 @@ function stopStreaming() {
     sourceNode.disconnect();
     sourceNode = null;
   }
+
+  // instead of closing AudioContext, just suspend it
   if (audioContext) {
-    audioContext.close();
+    audioContext.suspend();
     audioContext = null;
   }
 
+  // close WebSocket safely
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.close();
+  }
+
   isRecording = false;
-  recordBtn.textContent = "🎙️ Start Streaming";
-  recordBtn.classList.remove('recording');
-  setStatus("Streaming stopped");
+  setStatus("Stopped streaming");
 }
 
 // --- Toggle button ---
-recordBtn.addEventListener('click', async () => {
+recordBtn.addEventListener("click", async () => {
   if (!isRecording) {
     await startStreaming();
   } else {

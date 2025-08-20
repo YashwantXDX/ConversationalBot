@@ -47,29 +47,33 @@ class STTService:
         await websocket.accept()
         logger.info("Client connected to /ws/audio (streaming)")
 
+        loop = asyncio.get_running_loop()
         audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
-        loop = asyncio.get_event_loop()
+        ws_open = True  # guard to avoid sends after close
 
-        # Prepare AssemblyAI streaming client
         client = StreamingClient(StreamingClientOptions(api_key=self.api_key))
 
-        # Event handlers
-        def on_begin(self, event: BeginEvent):
+        # --- Event handlers ---
+        def on_begin(_client, event: BeginEvent):
             logger.info(f"[AssemblyAI] Session started: {event.id}")
 
-        def on_turn(self, event: TurnEvent):
+        def on_turn(_client, event: TurnEvent):
             text = event.transcript or ""
-            if text:
-                logger.info(f"[Transcript] {text}")
-                # Push transcript to browser UI
+            if not text or not ws_open:
+                return
+            try:
+                # schedule send on the main loop; don't block thread
                 asyncio.run_coroutine_threadsafe(websocket.send_text(text), loop)
+                logger.info(f"[Transcript] {text}")
+            except Exception as e:
+                logger.warning(f"Skip send_text after close: {e}")
 
-        def on_terminated(self, event: TerminationEvent):
+        def on_terminated(_client, event: TerminationEvent):
             logger.info(
                 f"[AssemblyAI] Session terminated; audio seconds processed={event.audio_duration_seconds}"
             )
 
-        def on_error(self, error: StreamingError):
+        def on_error(_client, error: StreamingError):
             logger.error(f"[AssemblyAI] Error: {error}")
 
         client.on(StreamingEvents.Begin, on_begin)
@@ -77,7 +81,7 @@ class STTService:
         client.on(StreamingEvents.Termination, on_terminated)
         client.on(StreamingEvents.Error, on_error)
 
-        # Start streaming session
+        # Start AssemblyAI streaming session
         client.connect(
             StreamingParameters(
                 sample_rate=16_000,
@@ -85,36 +89,52 @@ class STTService:
             )
         )
 
-        # Sync generator for SDK
+        # --- Thread-side generator: pull from asyncio.Queue safely ---
         def audio_generator():
             while True:
-                chunk = asyncio.run(audio_queue.get())
+                fut = asyncio.run_coroutine_threadsafe(audio_queue.get(), loop)
+                chunk = fut.result()  # blocks this thread, not the event loop
                 if chunk is None:
                     break
                 yield chunk
 
-        stream_task = asyncio.to_thread(client.stream, audio_generator())
+        # IMPORTANT: schedule the blocking stream on a background thread NOW
+        stream_task = asyncio.create_task(
+            asyncio.to_thread(client.stream, audio_generator())
+        )
 
         try:
             while True:
+                # Only accept binary frames (PCM16)
                 msg = await websocket.receive()
-                if "bytes" in msg and msg["bytes"] is not None:
+                if msg.get("bytes") is not None:
                     await audio_queue.put(msg["bytes"])
                 elif msg.get("type") == "websocket.disconnect":
                     raise WebSocketDisconnect()
-                else:
-                    continue
-
+                # ignore text frames/others
         except WebSocketDisconnect:
             logger.info("Browser websocket disconnected")
         except Exception as e:
             logger.error(f"Audio WebSocket error: {e}")
         finally:
+            # stop turn-sends and drain the generator
+            ws_open = False
+            # unblock generator
             await audio_queue.put(None)
+
+            # wait for the streaming thread to finish; cancel if stubborn
             try:
-                await stream_task
+                await asyncio.wait_for(stream_task, timeout=5)
+            except asyncio.TimeoutError:
+                stream_task.cancel()
+                try:
+                    await stream_task
+                except Exception:
+                    pass
             except Exception:
                 pass
+
+            # disconnect client & close socket
             try:
                 client.disconnect()
             except Exception:
@@ -123,4 +143,5 @@ class STTService:
                 await websocket.close()
             except Exception:
                 pass
+
             logger.info("Cleaned up streaming session")
